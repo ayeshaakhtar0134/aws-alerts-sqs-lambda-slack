@@ -1,0 +1,200 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Transform: AWS::Serverless-2016-10-31
+Description: >
+  CloudWatch alarms -> SNS -> SQS -> Lambda -> Slack.
+  The queue buffers alarm storms and retries failed Slack calls; messages that
+  still fail land in a dead-letter queue, which has its own alarm.
+
+Parameters:
+  Environment:
+    Type: String
+    Default: dev
+    AllowedValues: [dev, uat, prod]
+  SlackWebhookParameter:
+    Type: String
+    Default: alerts/slack-webhook-url
+    Description: Name (without the leading slash) of the SSM SecureString holding the Slack incoming-webhook URL
+  AlertEmail:
+    Type: String
+    Default: ""
+    Description: Optional fallback email if Slack is down (empty = none)
+
+Conditions:
+  HasAlertEmail: !Not [!Equals [!Ref AlertEmail, ""]]
+
+Globals:
+  Function:
+    Runtime: python3.12
+    Architectures: [arm64]
+    Timeout: 15
+    MemorySize: 128
+    Tracing: Active
+    Environment:
+      Variables:
+        ENVIRONMENT: !Ref Environment
+        POWERTOOLS_SERVICE_NAME: alert-forwarder
+
+Resources:
+  # ---------- Fan-in: every alarm publishes here ----------
+  AlertsTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: !Sub "${Environment}-alerts"
+      KmsMasterKeyId: alias/aws/sns
+
+  AlertsTopicPolicy:
+    Type: AWS::SNS::TopicPolicy
+    Properties:
+      Topics: [!Ref AlertsTopic]
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: AllowCloudWatchAlarms
+            Effect: Allow
+            Principal: { Service: cloudwatch.amazonaws.com }
+            Action: sns:Publish
+            Resource: !Ref AlertsTopic
+            Condition:
+              StringEquals: { "aws:SourceAccount": !Ref AWS::AccountId }
+
+  EmailFallback:
+    Type: AWS::SNS::Subscription
+    Condition: HasAlertEmail
+    Properties:
+      TopicArn: !Ref AlertsTopic
+      Protocol: email
+      Endpoint: !Ref AlertEmail
+
+  # ---------- Buffer ----------
+  AlertsDLQ:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: !Sub "${Environment}-alerts-dlq"
+      MessageRetentionPeriod: 1209600
+      SqsManagedSseEnabled: true
+
+  AlertsQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: !Sub "${Environment}-alerts"
+      VisibilityTimeout: 90 # 6x the Lambda timeout, as AWS recommends
+      SqsManagedSseEnabled: true
+      RedrivePolicy:
+        deadLetterTargetArn: !GetAtt AlertsDLQ.Arn
+        maxReceiveCount: 5
+
+  AlertsQueuePolicy:
+    Type: AWS::SQS::QueuePolicy
+    Properties:
+      Queues: [!Ref AlertsQueue]
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: { Service: sns.amazonaws.com }
+            Action: sqs:SendMessage
+            Resource: !GetAtt AlertsQueue.Arn
+            Condition:
+              ArnEquals: { "aws:SourceArn": !Ref AlertsTopic }
+
+  AlertsSubscription:
+    Type: AWS::SNS::Subscription
+    Properties:
+      TopicArn: !Ref AlertsTopic
+      Protocol: sqs
+      Endpoint: !GetAtt AlertsQueue.Arn
+      RawMessageDelivery: false
+
+  # ---------- Forwarder ----------
+  AlertForwarderFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub "${Environment}-alert-forwarder"
+      CodeUri: src/alert_forwarder/
+      Handler: app.handler
+      Environment:
+        Variables:
+          SLACK_WEBHOOK_PARAMETER: !Sub "/${SlackWebhookParameter}"
+      Policies:
+        - SSMParameterReadPolicy:
+            ParameterName: !Ref SlackWebhookParameter
+      Events:
+        Queue:
+          Type: SQS
+          Properties:
+            Queue: !GetAtt AlertsQueue.Arn
+            BatchSize: 10
+            MaximumBatchingWindowInSeconds: 5
+            FunctionResponseTypes: [ReportBatchItemFailures] # retry only the failed messages
+
+  AlertForwarderLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub "/aws/lambda/${AlertForwarderFunction}"
+      RetentionInDays: 30
+
+  # ---------- Watch the watcher ----------
+  DLQNotEmptyAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub "${Environment}-alerts-dlq-not-empty"
+      AlarmDescription: Alerts could not be delivered to Slack after 5 attempts
+      Namespace: AWS/SQS
+      MetricName: ApproximateNumberOfMessagesVisible
+      Dimensions:
+        - Name: QueueName
+          Value: !GetAtt AlertsDLQ.QueueName
+      Statistic: Maximum
+      Period: 60
+      EvaluationPeriods: 1
+      Threshold: 0
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+      # Only useful with the email fallback: if Slack delivery is broken, email still arrives
+      AlarmActions: !If [HasAlertEmail, [!Ref AlertsTopic], !Ref AWS::NoValue]
+
+  ForwarderErrorsAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub "${Environment}-alert-forwarder-errors"
+      AlarmDescription: The alert forwarder Lambda is throwing errors
+      Namespace: AWS/Lambda
+      MetricName: Errors
+      Dimensions:
+        - Name: FunctionName
+          Value: !Ref AlertForwarderFunction
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 0
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: [!Ref AlertsTopic]
+
+  # Demo alarm you can trigger by hand to test the whole path
+  DemoAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub "${Environment}-demo-alarm"
+      AlarmDescription: Test alarm. Trigger it with the set-alarm-state command in the README.
+      Namespace: Demo
+      MetricName: NeverEmitted
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: [!Ref AlertsTopic]
+      OKActions: [!Ref AlertsTopic]
+
+Outputs:
+  AlertsTopicArn:
+    Description: Point any CloudWatch alarm's actions at this topic
+    Value: !Ref AlertsTopic
+    Export:
+      Name: !Sub "${Environment}-alerts-topic-arn"
+  AlertsQueueUrl:
+    Value: !Ref AlertsQueue
+  DeadLetterQueueUrl:
+    Value: !Ref AlertsDLQ
