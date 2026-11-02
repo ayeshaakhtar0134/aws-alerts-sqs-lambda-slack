@@ -1,0 +1,8 @@
+{
+  "Records": [
+    {
+      "messageId": "11111111-1111-1111-1111-111111111111",
+      "body": "{\"Type\":\"Notification\",\"Subject\":\"ALARM: \\\"dev-api-latency-p95\\\" in US East (N. Virginia)\",\"Message\":\"{\\\"AlarmName\\\":\\\"dev-api-latency-p95\\\",\\\"AlarmDescription\\\":\\\"95% of API requests are slower than 1 second\\\",\\\"NewStateValue\\\":\\\"ALARM\\\",\\\"OldStateValue\\\":\\\"OK\\\",\\\"NewStateReason\\\":\\\"Threshold Crossed: 3 out of the last 5 datapoints were greater than the threshold (1.0).\\\",\\\"StateChangeTime\\\":\\\"2026-11-02T20:15:00.000+0000\\\",\\\"Region\\\":\\\"US East (N. Virginia)\\\",\\\"Trigger\\\":{\\\"MetricName\\\":\\\"TargetResponseTime\\\",\\\"Namespace\\\":\\\"AWS/ApplicationELB\\\"}}\"}"
+    }
+  ]
+}
