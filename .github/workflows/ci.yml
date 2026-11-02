@@ -38,4 +38,6 @@ jobs:
         with:
           use-installer: true
       - name: sam build
-        run: sam build --use-container=false
+        run: sam build
+        env:
+          AWS_DEFAULT_REGION: us-east-1
